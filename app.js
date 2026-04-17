@@ -1,144 +1,286 @@
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const path = require('path');
+const db = require('./database');
+
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 app.use(express.json());
+app.use(express.static('public'));
 
-let CONNECTION_POOL_LIMIT = 10;
-let activeConnections = 0;
+// ── State ────────────────────────────────────────────────
+let activeConnections = [];
+let MESSAGE_RATE_LIMIT = 100;   // max messages per minute
+let messageCount = 0;
+let dbQueryDelay = 0;           // simulate slow DB
 let incidentActive = false;
+let memoryLeakArray = [];       // for OOM simulation
 
-// Helper to print structured JSON logs
-function log(service, level, message, latency_ms, status_code) {
+// ── Structured Logger ────────────────────────────────────
+function log(service, level, message, meta = {}) {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     service,
     level,
     message,
-    latency_ms,
-    status_code
+    latency_ms: meta.latency || 0,
+    status_code: meta.status || 200,
+    ...meta
   }));
 }
 
-// ─── NORMAL ROUTES ───────────────────────────────────────────
+// ── WebSocket Connections ────────────────────────────────
+wss.on('connection', (ws, req) => {
+  const connId = `conn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  ws.connId = connId;
+  activeConnections.push(ws);
+
+  log('websocket', 'INFO', `New connection established conn_id=${connId}`,
+    { conn_id: connId, total_connections: activeConnections.length });
+
+  ws.on('message', async (data) => {
+    const start = Date.now();
+    try {
+      const msg = JSON.parse(data);
+
+      // Rate limit check
+      messageCount++;
+      if (messageCount > MESSAGE_RATE_LIMIT) {
+        log('message-broker', 'ERROR',
+          `Rate limit exceeded — dropping message user=${msg.username} rate=${messageCount}/min`,
+          { status: 429, latency: Date.now() - start });
+        ws.send(JSON.stringify({ error: 'Rate limit exceeded', code: 429 }));
+        return;
+      }
+
+      // Simulate DB delay during incident
+      if (dbQueryDelay > 0) {
+        await new Promise(r => setTimeout(r, dbQueryDelay));
+      }
+
+      if (incidentActive) {
+        log('database', 'ERROR',
+          `ECONNREFUSED — SQLite write timeout after ${dbQueryDelay}ms msg_id=pending`,
+          { status: 500, latency: dbQueryDelay });
+        ws.send(JSON.stringify({ error: 'Database unavailable', code: 500 }));
+        return;
+      }
+
+      // Save message to DB
+      const user = db.prepare(`SELECT id FROM users WHERE username = ?`).get(msg.username);
+      const room = db.prepare(`SELECT id FROM rooms WHERE name = ?`).get(msg.room);
+
+      if (!user || !room) {
+        log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
+          { status: 404, latency: Date.now() - start });
+        return;
+      }
+
+      const result = db.prepare(
+        `INSERT INTO messages (room_id, user_id, content) VALUES (?, ?, ?)`
+      ).run(room.id, user.id, msg.content);
+
+      const latency = Date.now() - start;
+      log('database', latency > 500 ? 'WARN' : 'INFO',
+        `Message saved msg_id=${result.lastInsertRowid} room=${msg.room} user=${msg.username}`,
+        { latency, msg_id: result.lastInsertRowid, room: msg.room });
+
+      // Broadcast to room
+      const broadcast = JSON.stringify({
+        type: 'message',
+        id: result.lastInsertRowid,
+        username: msg.username,
+        room: msg.room,
+        content: msg.content,
+        timestamp: new Date().toISOString()
+      });
+
+      let delivered = 0;
+      activeConnections.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(broadcast);
+          delivered++;
+        }
+      });
+
+      log('message-broker', 'INFO',
+        `Message broadcast msg_id=${result.lastInsertRowid} delivered=${delivered} clients`,
+        { latency: Date.now() - start, delivered });
+
+    } catch (err) {
+      log('api-gateway', 'ERROR', `Message processing failed error=${err.message}`,
+        { status: 500, latency: Date.now() - start, error: err.message });
+    }
+  });
+
+  ws.on('close', () => {
+    activeConnections = activeConnections.filter(c => c.connId !== connId);
+    log('websocket', 'INFO', `Connection closed conn_id=${connId}`,
+      { conn_id: connId, remaining_connections: activeConnections.length });
+  });
+
+  ws.on('error', (err) => {
+    log('websocket', 'ERROR', `WebSocket error conn_id=${connId} error=${err.message}`,
+      { status: 500, conn_id: connId });
+  });
+});
+
+// ── REST API ─────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 app.get('/health', (req, res) => {
-  log('api-gateway', 'INFO', 'Health check passed', 12, 200);
-  res.json({ status: 'ok', pool: `${activeConnections}/${CONNECTION_POOL_LIMIT}` });
+  const status = incidentActive ? 'degraded' : 'ok';
+  log('api-gateway', incidentActive ? 'WARN' : 'INFO',
+    `Health check — status=${status} connections=${activeConnections.length}`,
+    { latency: 5 });
+  res.json({
+    status,
+    active_connections: activeConnections.length,
+    message_rate: messageCount,
+    db_delay_ms: dbQueryDelay,
+    incident: incidentActive
+  });
 });
 
-app.get('/api/orders', (req, res) => {
-  activeConnections++;
-
-  if (activeConnections > CONNECTION_POOL_LIMIT) {
-    log('database', 'ERROR',
-      `ECONNREFUSED — connection pool exhausted max=${CONNECTION_POOL_LIMIT} active=${activeConnections}`,
-      5000 + Math.floor(Math.random() * 3000), 500);
-    log('api-gateway', 'ERROR',
-      `Upstream timeout waiting for database response after 8000ms`,
-      8001, 504);
-    activeConnections = Math.max(0, activeConnections - 1);
-    return res.status(500).json({ error: 'Database connection pool exhausted' });
+app.get('/api/rooms', (req, res) => {
+  const start = Date.now();
+  try {
+    const rooms = db.prepare(`SELECT * FROM rooms`).all();
+    log('api-gateway', 'INFO', `GET /api/rooms rooms=${rooms.length}`,
+      { latency: Date.now() - start, status: 200 });
+    res.json({ rooms });
+  } catch (err) {
+    log('api-gateway', 'ERROR', `Failed to fetch rooms error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
   }
-
-  log('api-gateway', 'INFO', `GET /api/orders 200 OK`, 140, 200);
-  setTimeout(() => activeConnections = Math.max(0, activeConnections - 1), 2000);
-  res.json({ orders: [{ id: 1, item: 'Product A' }, { id: 2, item: 'Product B' }] });
 });
 
-app.get('/api/auth', (req, res) => {
-  if (incidentActive) {
-    log('auth-service', 'ERROR',
-      'Cannot validate token — database unavailable user_id=4821',
-      7800, 503);
-    return res.status(503).json({ error: 'Auth service unavailable' });
+app.get('/api/messages/:room', (req, res) => {
+  const start = Date.now();
+  try {
+    if (incidentActive) {
+      log('database', 'ERROR',
+        `Query timeout on messages table room=${req.params.room} waited=${dbQueryDelay}ms`,
+        { status: 503, latency: dbQueryDelay });
+      return res.status(503).json({ error: 'Database timeout' });
+    }
+    const messages = db.prepare(`
+      SELECT m.id, m.content, m.created_at, u.username, r.name as room
+      FROM messages m
+      JOIN users u ON m.user_id = u.id
+      JOIN rooms r ON m.room_id = r.id
+      WHERE r.name = ?
+      ORDER BY m.created_at DESC LIMIT 50
+    `).all(req.params.room);
+    log('database', 'INFO',
+      `Messages fetched room=${req.params.room} count=${messages.length}`,
+      { latency: Date.now() - start, status: 200 });
+    res.json({ messages: messages.reverse() });
+  } catch (err) {
+    log('database', 'ERROR', `DB query failed error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
   }
-  log('auth-service', 'INFO', 'Token validated for user_id=4821', 88, 200);
-  res.json({ valid: true });
 });
 
-app.get('/api/payment', (req, res) => {
-  if (incidentActive) {
-    log('payment-service', 'ERROR',
-      'Payment FAILED txn_id=TXN998900 reason=auth_service_unavailable',
-      7500, 502);
-    return res.status(502).json({ error: 'Payment failed' });
-  }
-  log('payment-service', 'INFO',
-    'Payment processed txn_id=TXN998821 amount=1200.00', 193, 200);
-  res.json({ success: true, txn_id: 'TXN998821' });
-});
-
-// ─── INCIDENT TRIGGER ─────────────────────────────────────────
+// ── 💥 TRIGGER INCIDENT ──────────────────────────────────
 
 app.get('/trigger-incident', (req, res) => {
   incidentActive = true;
-  CONNECTION_POOL_LIMIT = 0;
-  activeConnections = 100;
+  dbQueryDelay = 8000;
+  MESSAGE_RATE_LIMIT = 2;
+  messageCount = 999;
 
-  // Burst of FATAL logs
+  // Burst of realistic chat app errors
   log('database', 'FATAL',
-    'Max retry attempts reached — database unreachable host=db.internal:5432',
-    9999, 503);
+    'ECONNREFUSED — SQLite connection pool exhausted max=10 active=10',
+    { status: 503, latency: 9999 });
   log('database', 'ERROR',
-    'ECONNREFUSED — connection pool exhausted max=100 active=100',
-    5000, 500);
-  log('database', 'FATAL',
-    'Deadlock detected on table=orders waiting_txns=47',
-    8900, 503);
-  log('database', 'ERROR',
-    'Transaction rollback forced txn_id=TXN991234 reason=connection_lost',
-    5200, 500);
+    'Write transaction timeout — messages table locked waited=8000ms',
+    { status: 500, latency: 8001 });
+  log('message-broker', 'ERROR',
+    'Message queue backed up — 847 undelivered messages pending',
+    { status: 500, latency: 7800 });
+  log('websocket', 'ERROR',
+    'WebSocket broadcast failed — 12 connections dropped simultaneously',
+    { status: 500, latency: 6500 });
+  log('message-broker', 'FATAL',
+    'Rate limiter overwhelmed — 999 msg/min threshold breached dropping all messages',
+    { status: 503, latency: 9100 });
   log('api-gateway', 'ERROR',
-    'Circuit breaker OPEN for route /api/orders — too many failures',
-    8200, 503);
-  log('auth-service', 'ERROR',
-    'Cannot validate token — database unavailable user_id=4821',
-    7800, 503);
-  log('payment-service', 'FATAL',
-    'Payment gateway DOWN — 3 consecutive failures txn_id=TXN998900,TXN998901,TXN998902',
-    9100, 503);
+    'GET /api/messages/general timeout after 8000ms — upstream DB unresponsive',
+    { status: 504, latency: 8002 });
   log('database', 'FATAL',
-    'OOM warning — heap usage at 94% forcing garbage collection',
-    6700, 503);
+    'OOM warning — heap usage at 91% memory_used=450MB memory_limit=512MB',
+    { status: 503, latency: 6700 });
+  log('websocket', 'ERROR',
+    'Heartbeat timeout — conn_id=conn_1713001234_abc12 conn_id=conn_1713001235_xyz89 dead',
+    { status: 500, latency: 5000 });
+  log('api-gateway', 'FATAL',
+    'Health check FAILED — services: database, message-broker, websocket all degraded',
+    { status: 503, latency: 9999 });
 
-  res.json({ message: '💥 Incident triggered — check your logs!' });
+  // Simulate memory leak
+  for (let i = 0; i < 50000; i++) {
+    memoryLeakArray.push(`leak_data_${i}_${'x'.repeat(100)}`);
+  }
+
+  res.json({ message: '💥 ChatFlow incident triggered — DB timeout + rate limit + OOM!' });
 });
 
-// ─── FIX / RESOLVE ────────────────────────────────────────────
+// ── ✅ FIX INCIDENT ──────────────────────────────────────
 
 app.get('/fix-incident', (req, res) => {
   incidentActive = false;
-  CONNECTION_POOL_LIMIT = 10;
-  activeConnections = 0;
+  dbQueryDelay = 0;
+  MESSAGE_RATE_LIMIT = 100;
+  messageCount = 0;
+  memoryLeakArray = [];    // free memory
 
   log('database', 'INFO',
-    'Connection pool restored max=10 — all connections flushed successfully',
-    45, 200);
+    'Connection pool restored — all transactions flushed successfully',
+    { status: 200, latency: 45 });
   log('database', 'INFO',
-    'Deadlock resolved — table=orders unlocked waiting_txns=0',
-    30, 200);
-  log('auth-service', 'INFO',
-    'Service recovered — database connection re-established',
-    92, 200);
+    'Write lock released — messages table unlocked and writable',
+    { status: 200, latency: 30 });
+  log('message-broker', 'INFO',
+    'Message queue cleared — 0 pending messages rate_limit reset to 100/min',
+    { status: 200, latency: 55 });
+  log('websocket', 'INFO',
+    'WebSocket connections restored — 12 clients reconnected successfully',
+    { status: 200, latency: 80 });
   log('api-gateway', 'INFO',
-    'Circuit breaker CLOSED — /api/orders route restored',
-    55, 200);
-  log('payment-service', 'INFO',
-    'Payment gateway RESTORED — processing queue resumed',
-    110, 200);
+    'All routes healthy — /api/messages /api/rooms /ws responding normally',
+    { status: 200, latency: 12 });
+  log('database', 'INFO',
+    'Memory freed — heap usage at 34% memory_used=172MB memory_limit=512MB',
+    { status: 200, latency: 20 });
 
-  res.json({ message: '✅ Incident resolved — all services restored' });
+  res.json({ message: '✅ ChatFlow fully restored — all services operational!' });
 });
 
-// ─── START ────────────────────────────────────────────────────
+// ── START SERVER ─────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    service: 'api-gateway',
-    level: 'INFO',
-    message: `IncidentIQ Demo App started on port ${PORT}`,
-    latency_ms: 0,
-    status_code: 200
-  }));
+server.listen(PORT, () => {
+  log('api-gateway', 'INFO',
+    `ChatFlow server started on port ${PORT}`,
+    { status: 200, latency: 0 });
 });
+
+// Reset message counter every minute
+setInterval(() => {
+  if (!incidentActive) {
+    messageCount = 0;
+    log('message-broker', 'INFO',
+      `Rate limit counter reset — message_count=0 connections=${activeConnections.length}`,
+      { latency: 0 });
+  }
+}, 60000);

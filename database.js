@@ -97,6 +97,28 @@ function handleDeadlock(pool, query) {
     });
 }
 
+function lockTable(pool, tableName) {
+  return pool.query(`LOCK TABLE ${tableName} IN EXCLUSIVE MODE`)
+    .then((res) => {
+      return res.rows;
+    })
+    .catch((err) => {
+      console.error('Database query error:', err);
+      throw err;
+    });
+}
+
+function unlockTable(pool, tableName) {
+  return pool.query(`UNLOCK TABLE ${tableName}`)
+    .then((res) => {
+      return res.rows;
+    })
+    .catch((err) => {
+      console.error('Database query error:', err);
+      throw err;
+    });
+}
+
 module.exports = {
   connectToDatabase,
   queryDatabase,
@@ -104,6 +126,8 @@ module.exports = {
   acquireConnectionWithRetry,
   executeTransaction,
   handleDeadlock,
+  lockTable,
+  unlockTable,
 }; 
 
 FILENAME: app.js
@@ -180,16 +204,19 @@ wss.on('connection', (ws, req) => {
       }
 
       // Save message to DB
+      await db.lockTable(db.pool, 'orders');
       const user = await db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
       const room = await db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
 
       if (!user || !room) {
         log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
           { status: 404, latency: Date.now() - start });
+        await db.unlockTable(db.pool, 'orders');
         return;
       }
 
       const result = await db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
+      await db.unlockTable(db.pool, 'orders');
 
       const latency = Date.now() - start;
       log('database', latency > 500 ? 'WARN' : 'INFO',

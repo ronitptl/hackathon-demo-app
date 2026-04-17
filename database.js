@@ -6,56 +6,56 @@ function connectToDatabase() {
   function attemptConnection() {
     try {
       // Establish a connection to the database
-      const db = require('db-lib');
-      db.connect('host=db.internal:5432', (err) => {
-        if (err) {
-          if (retryCount < maxRetryAttempts) {
-            retryCount++;
-            setTimeout(attemptConnection, retryDelay);
-          } else {
-            throw new Error('Max retry attempts reached — database unreachable');
-          }
-        } else {
-          // Connection established, proceed with database operations
-          console.log('Connected to database');
-        }
-      });
+      const dbConnection = establishDbConnection();
+      return dbConnection;
     } catch (error) {
-      console.error(error);
+      if (error.code === 'ECONNREFUSED') {
+        retryCount++;
+        if (retryCount <= maxRetryAttempts) {
+          setTimeout(attemptConnection, retryDelay);
+        } else {
+          throw new Error('Max retry attempts reached — database unreachable');
+        }
+      } else {
+        throw error;
+      }
     }
   }
 
-  attemptConnection();
+  return attemptConnection();
 }
 
-// Implement connection pooling to prevent exhaustion
-const connectionPool = [];
-const maxPoolSize = 100;
+function establishDbConnection() {
+  // Implement database connection logic here
+  // For example, using a database driver like pg for PostgreSQL
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    user: 'username',
+    host: 'db.internal',
+    database: 'database',
+    password: 'password',
+    port: 5432,
+  });
 
-function getConnection() {
-  if (connectionPool.length < maxPoolSize) {
-    const connection = connectToDatabase();
-    connectionPool.push(connection);
-    return connection;
+  return pool;
+}
+
+function handleDatabaseError(error) {
+  if (error.code === 'ECONNREFUSED') {
+    console.error('ECONNREFUSED — connection pool exhausted');
+  } else if (error.message.includes('Deadlock detected')) {
+    console.error('Deadlock detected on table=orders');
   } else {
-    throw new Error('ECONNREFUSED — connection pool exhausted');
+    console.error('Unknown database error:', error);
   }
 }
 
-// Implement deadlock detection and prevention
-const waitingTransactions = {};
-
-function executeTransaction(transactionId) {
-  if (waitingTransactions[transactionId]) {
-    throw new Error('Deadlock detected on table=orders waiting_txns=' + Object.keys(waitingTransactions).length);
+// Example usage:
+const dbConnection = connectToDatabase();
+dbConnection.query('SELECT * FROM orders', (error, results) => {
+  if (error) {
+    handleDatabaseError(error);
   } else {
-    waitingTransactions[transactionId] = true;
-    // Execute the transaction
-    console.log('Transaction executed');
-    delete waitingTransactions[transactionId];
+    console.log(results.rows);
   }
-}
-
-connectToDatabase();
-getConnection();
-executeTransaction('transaction-1');
+});

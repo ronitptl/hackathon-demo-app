@@ -1,33 +1,4 @@
 function connectToDatabase() {
-  const maxRetryAttempts = 5;
-  const retryDelay = 500; // milliseconds
-  let retryCount = 0;
-
-  function attemptConnection() {
-    try {
-      // Establish a connection to the database
-      const dbConnection = establishDbConnection();
-      return dbConnection;
-    } catch (error) {
-      if (error.code === 'ECONNREFUSED') {
-        retryCount++;
-        if (retryCount <= maxRetryAttempts) {
-          setTimeout(attemptConnection, retryDelay);
-        } else {
-          throw new Error('Max retry attempts reached — database unreachable');
-        }
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  return attemptConnection();
-}
-
-function establishDbConnection() {
-  // Implement database connection logic here
-  // For example, using a database driver like pg for PostgreSQL
   const { Pool } = require('pg');
   const pool = new Pool({
     user: 'username',
@@ -35,27 +6,60 @@ function establishDbConnection() {
     database: 'database',
     password: 'password',
     port: 5432,
+    max: 100,
+    idleTimeoutMillis: 30000
+  });
+
+  pool.on('error', (err, client) => {
+    console.error('Unexpected error on idle client', err);
+    process.exit(-1);
   });
 
   return pool;
 }
 
-function handleDatabaseError(error) {
-  if (error.code === 'ECONNREFUSED') {
-    console.error('ECONNREFUSED — connection pool exhausted');
-  } else if (error.message.includes('Deadlock detected')) {
-    console.error('Deadlock detected on table=orders');
-  } else {
-    console.error('Unknown database error:', error);
-  }
+function queryDatabase(pool, query) {
+  return pool.query(query)
+    .then((res) => {
+      return res.rows;
+    })
+    .catch((err) => {
+      console.error('Error querying database', err);
+      throw err;
+    });
 }
 
-// Example usage:
-const dbConnection = connectToDatabase();
-dbConnection.query('SELECT * FROM orders', (error, results) => {
-  if (error) {
-    handleDatabaseError(error);
-  } else {
-    console.log(results.rows);
-  }
-});
+function closeDatabaseConnection(pool) {
+  pool.end();
+}
+
+// Added a mechanism to handle connection pool exhaustion
+function handleConnectionPoolExhaustion(pool) {
+  pool.on('error', (err) => {
+    if (err.code === 'ECONNREFUSED') {
+      console.error('Connection pool exhausted. Waiting for 5 seconds before retrying...');
+      setTimeout(() => {
+        connectToDatabase();
+      }, 5000);
+    }
+  });
+}
+
+// Added a mechanism to detect and handle deadlocks
+function handleDeadlock(pool) {
+  pool.on('error', (err) => {
+    if (err.code === '40P01') { // 40P01 is the PostgreSQL error code for deadlock
+      console.error('Deadlock detected. Rolling back transaction and retrying...');
+      pool.query('ROLLBACK');
+      connectToDatabase();
+    }
+  });
+}
+
+module.exports = {
+  connectToDatabase,
+  queryDatabase,
+  closeDatabaseConnection,
+  handleConnectionPoolExhaustion,
+  handleDeadlock
+};

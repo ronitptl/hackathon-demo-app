@@ -20,6 +20,7 @@ function connectToDatabase() {
   }
 
   function createConnection() {
+    // Simulate creating a database connection
     return {};
   }
 
@@ -34,48 +35,58 @@ const db = connectToDatabase();
 function executeQuery(query) {
   const connection = db.getConnection();
   try {
+    // Simulate executing a query
     console.log(`Executing query: ${query}`);
-    return true;
+    return connection;
   } catch (error) {
     console.error(`Error executing query: ${error.message}`);
-    return false;
+    throw error;
   } finally {
     db.releaseConnection(connection);
   }
 }
 
-let waitingTransactions = 0;
-function executeTransaction(transaction) {
-  waitingTransactions++;
-  try {
-    console.log(`Executing transaction: ${transaction}`);
-    return true;
-  } catch (error) {
-    console.error(`Error executing transaction: ${error.message}`);
-    return false;
-  } finally {
-    waitingTransactions--;
-    if (waitingTransactions > 47) {
-      throw new Error('Deadlock detected');
+// To prevent deadlock, use a lock mechanism
+class Lock {
+  constructor() {
+    this.locked = false;
+    this.queue = [];
+  }
+
+  acquire() {
+    return new Promise((resolve) => {
+      if (!this.locked) {
+        this.locked = true;
+        resolve();
+      } else {
+        this.queue.push(resolve);
+      }
+    });
+  }
+
+  release() {
+    if (this.queue.length > 0) {
+      const resolve = this.queue.shift();
+      resolve();
+    } else {
+      this.locked = false;
     }
   }
 }
 
-// BUG: db.connectionPool is undefined — should be connectionPool inside closure
-// This will throw a TypeError at runtime and crash the monitoring interval
-setInterval(() => {
-  const activeConnections = db.connectionPool.length;
-  if (activeConnections >= 100) {
-    console.error('Connection pool exhausted');
-  }
-}, 1000);
+const lock = new Lock();
 
-// BUG: global.gc() is not defined unless Node is started with --expose-gc flag
-// This crashes the process with TypeError: global.gc is not a function
-setInterval(() => {
-  const heapUsage = process.memoryUsage().heapUsed / process.memoryUsage().heapTotal;
-  if (heapUsage > 0.94) {
-    console.error('OOM warning — heap usage at 94% forcing garbage collection');
-    global.gc();
+async function executeQueryWithLock(query) {
+  await lock.acquire();
+  try {
+    return executeQuery(query);
+  } catch (error) {
+    console.error(`Error executing query with lock: ${error.message}`);
+    throw error;
+  } finally {
+    lock.release();
   }
-}, 1000);
+}
+
+// Example usage:
+executeQueryWithLock('SELECT * FROM orders');

@@ -70,18 +70,19 @@ wss.on('connection', (ws, req) => {
       }
 
       // Save message to DB
-      const user = db.prepare(`SELECT id FROM users WHERE username = ?`).get(msg.username);
-      const room = db.prepare(`SELECT id FROM rooms WHERE name = ?`).get(msg.room);
+      await db.lockTable(db.pool, 'orders');
+      const user = await db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
+      const room = await db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
 
       if (!user || !room) {
         log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
           { status: 404, latency: Date.now() - start });
+        await db.unlockTable(db.pool, 'orders');
         return;
       }
 
-      const result = db.prepare(
-        `INSERT INTO messages (room_id, user_id, content) VALUES (?, ?, ?)`
-      ).run(room.id, user.id, msg.content);
+      const result = await db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
+      await db.unlockTable(db.pool, 'orders');
 
       const latency = Date.now() - start;
       log('database', latency > 500 ? 'WARN' : 'INFO',
@@ -151,7 +152,7 @@ app.get('/health', (req, res) => {
 app.get('/api/rooms', (req, res) => {
   const start = Date.now();
   try {
-    const rooms = db.prepare(`SELECT * FROM rooms`).all();
+    const rooms = db.handleDeadlock(db.pool, `SELECT * FROM rooms`);
     log('api-gateway', 'INFO', `GET /api/rooms rooms=${rooms.length}`,
       { latency: Date.now() - start, status: 200 });
     res.json({ rooms });
@@ -171,14 +172,14 @@ app.get('/api/messages/:room', (req, res) => {
         { status: 503, latency: dbQueryDelay });
       return res.status(503).json({ error: 'Database timeout' });
     }
-    const messages = db.prepare(`
+    const messages = db.handleDeadlock(db.pool, `
       SELECT m.id, m.content, m.created_at, u.username, r.name as room
       FROM messages m
       JOIN users u ON m.user_id = u.id
       JOIN rooms r ON m.room_id = r.id
-      WHERE r.name = ?
+      WHERE r.name = '${req.params.room}'
       ORDER BY m.created_at DESC LIMIT 50
-    `).all(req.params.room);
+    `);
     log('database', 'INFO',
       `Messages fetched room=${req.params.room} count=${messages.length}`,
       { latency: Date.now() - start, status: 200 });
@@ -284,3 +285,20 @@ setInterval(() => {
       { latency: 0 });
   }
 }, 60000);
+
+// Initialize database connection
+db.pool = db.connectToDatabase();
+
+// Add a lock on the orders table to prevent deadlocks
+app.get('/api/orders', async (req, res) => {
+  try {
+    await db.lockTable(db.pool, 'orders');
+    const orders = await db.handleDeadlock(db.pool, 'SELECT * FROM orders');
+    await db.unlockTable(db.pool, 'orders');
+    res.json(orders);
+  } catch (err) {
+    log('database', 'ERROR', `Failed to fetch orders error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
+  }
+});

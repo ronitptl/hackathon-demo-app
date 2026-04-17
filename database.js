@@ -8,7 +8,7 @@ function connectToDatabase() {
     port: 5432,
     max: 100,
     idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 5000, // added connection timeout
+    connectionTimeoutMillis: 5000, 
   });
 
   pool.on('error', (err) => {
@@ -81,14 +81,13 @@ function executeTransaction(pool, query) {
     });
 }
 
-// added a function to handle deadlocks
 function handleDeadlock(pool, query) {
   return pool.query(query)
     .then((res) => {
       return res.rows;
     })
     .catch((err) => {
-      if (err.code === '40P01') { // deadlock detected
+      if (err.code === '40P01') { 
         console.error('Deadlock detected. Retrying query...');
         return handleDeadlock(pool, query);
       } else {
@@ -105,7 +104,7 @@ module.exports = {
   acquireConnectionWithRetry,
   executeTransaction,
   handleDeadlock,
-};
+}; 
 
 FILENAME: app.js
 ===
@@ -181,8 +180,8 @@ wss.on('connection', (ws, req) => {
       }
 
       // Save message to DB
-      const user = db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
-      const room = db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
+      const user = await db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
+      const room = await db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
 
       if (!user || !room) {
         log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
@@ -190,7 +189,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      const result = db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
+      const result = await db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
 
       const latency = Date.now() - start;
       log('database', latency > 500 ? 'WARN' : 'INFO',

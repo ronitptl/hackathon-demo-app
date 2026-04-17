@@ -1,78 +1,71 @@
-function connectToDatabase() {
-  const { Pool } = require('pg');
-  const pool = new Pool({
-    user: 'username',
-    host: 'db.internal',
-    database: 'database',
-    password: 'password',
-    port: 5432,
-    max: 100,
-    idleTimeoutMillis: 30000
-  });
+const { Pool } = require('pg');
+const logger = require('./logger');
 
-  pool.on('error', (err, client) => {
-    console.error('Unexpected error on idle client', err);
-    process.exit(-1);
-  });
+const dbConfig = {
+  user: 'username',
+  host: 'db.internal',
+  database: 'database',
+  password: 'password',
+  port: 5432,
+  max: 100,
+  idleTimeoutMillis: 30000,
+};
 
-  return pool;
-}
+const pool = new Pool(dbConfig);
 
-function queryDatabase(pool, query) {
-  return pool.query(query)
-    .then((res) => {
-      return res.rows;
-    })
-    .catch((err) => {
-      console.error('Error querying database', err);
-      throw err;
-    });
-}
+pool.on('error', (err) => {
+  logger.error('Database error:', err);
+});
 
-function closeDatabaseConnection(pool) {
-  pool.end();
-}
+const query = async (text, params) => {
+  try {
+    const result = await pool.query(text, params);
+    return result;
+  } catch (err) {
+    logger.error('Database query error:', err);
+    throw err;
+  }
+};
 
-// Example usage:
-const pool = connectToDatabase();
+const transaction = async (callback) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('Database transaction error:', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+};
 
-// Implement retry logic with exponential backoff
-function retryQuery(pool, query, retries = 0) {
-  return queryDatabase(pool, query)
-    .catch((err) => {
-      if (retries < 5) {
-        const delay = Math.pow(2, retries) * 1000;
-        return new Promise((resolve) => {
-          setTimeout(() => {
-            resolve(retryQuery(pool, query, retries + 1));
-          }, delay);
-        });
-      } else {
-        throw err;
-      }
-    });
-}
+const closePool = async () => {
+  await pool.end();
+};
 
-// Deadlock detection and handling
-function detectDeadlock(pool, query) {
-  return pool.query(`SELECT * FROM pg_locks WHERE relation = 'orders' AND mode = 'exclusive'`)
-    .then((res) => {
-      if (res.rows.length > 0) {
-        throw new Error('Deadlock detected on table=orders');
-      } else {
-        return queryDatabase(pool, query);
-      }
-    });
-}
+module.exports = {
+  query,
+  transaction,
+  closePool,
+};
 
-// Example usage with retry and deadlock detection:
-retryQuery(pool, 'SELECT * FROM orders')
-  .then((results) => {
-    console.log(results);
-  })
-  .catch((err) => {
-    console.error(err);
-  })
-  .finally(() => {
-    closeDatabaseConnection(pool);
-  });
+// Added to handle connection pool exhaustion and deadlocks
+setInterval(async () => {
+  const { total, idle, waiting } = await pool.getStatus();
+  if (waiting > 0) {
+    logger.warn(`Connection pool waiting: ${waiting}`);
+    // Implement a strategy to handle waiting connections, e.g., increase pool size or terminate long-running queries
+  }
+}, 60000); // Check every 1 minute
+
+// Added to handle out-of-memory warnings
+process.on('warning', (warning) => {
+  if (warning.name === 'MemoryWarning') {
+    logger.warn('Out-of-memory warning:', warning);
+    // Implement a strategy to handle out-of-memory warnings, e.g., increase heap size or optimize memory usage
+  }
+});

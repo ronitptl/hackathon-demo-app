@@ -1,78 +1,125 @@
 function connectToDatabase() {
-  const { Pool } = require('pg');
-  const pool = new Pool({
-    user: 'username',
-    host: 'db.internal',
-    database: 'database',
-    password: 'password',
-    port: 5432,
-    max: 100,
-    idleTimeoutMillis: 30000
-  });
+  const maxConnections = 100;
+  const connectionPool = [];
 
-  pool.on('error', (err, client) => {
-    console.error('Unexpected error on idle client', err);
-    process.exit(-1);
-  });
+  function getConnection() {
+    if (connectionPool.length < maxConnections) {
+      const connection = createConnection();
+      connectionPool.push(connection);
+      return connection;
+    } else {
+      throw new Error('Connection pool exhausted');
+    }
+  }
 
-  return pool;
+  function releaseConnection(connection) {
+    const index = connectionPool.indexOf(connection);
+    if (index !== -1) {
+      connectionPool.splice(index, 1);
+    }
+  }
+
+  function createConnection() {
+    // Simulate creating a database connection
+    return {};
+  }
+
+  return {
+    getConnection,
+    releaseConnection,
+  };
 }
 
-function queryDatabase(pool, query) {
-  return pool.query(query)
-    .then((res) => {
-      return res.rows;
-    })
-    .catch((err) => {
-      console.error('Error querying database', err);
-      throw err;
-    });
+const db = connectToDatabase();
+
+function executeQuery(query) {
+  const connection = db.getConnection();
+  try {
+    // Simulate executing a query
+    console.log(`Executing query: ${query}`);
+    return connection;
+  } catch (error) {
+    console.error(`Error executing query: ${error.message}`);
+    throw error;
+  } finally {
+    db.releaseConnection(connection);
+  }
 }
 
-function closeDatabaseConnection(pool) {
-  pool.end();
-}
+// To prevent deadlock, use a lock mechanism
+class Lock {
+  constructor() {
+    this.locked = false;
+    this.queue = [];
+  }
 
-// Example usage:
-const pool = connectToDatabase();
-
-// Implement retry logic with exponential backoff
-function retryQuery(pool, query, retries = 0) {
-  return queryDatabase(pool, query)
-    .catch((err) => {
-      if (retries < 5) {
-        const delay = Math.pow(2, retries) * 1000;
-        return new Promise((resolve) => {
-          setTimeout(() => {
-            resolve(retryQuery(pool, query, retries + 1));
-          }, delay);
-        });
+  acquire() {
+    return new Promise((resolve) => {
+      if (!this.locked) {
+        this.locked = true;
       } else {
-        throw err;
+        this.queue.push(resolve);
       }
     });
+  }
+
+  release() {
+    if (this.queue.length > 0) {
+      const resolve = this.queue.shift();
+      resolve();
+    } else {
+      this.locked = false;
+    }
+  }
 }
 
-// Deadlock detection and handling
-function detectDeadlock(pool, query) {
-  return pool.query(`SELECT * FROM pg_locks WHERE relation = 'orders' AND mode = 'exclusive'`)
-    .then((res) => {
-      if (res.rows.length > 0) {
-        throw new Error('Deadlock detected on table=orders');
-      } else {
-        return queryDatabase(pool, query);
-      }
-    });
+const lock = new Lock();
+
+async function executeQueryWithLock(query) {
+  await lock.acquire();
+  try {
+    executeQuery(query);
+  } catch (error) {
+    console.error(`Error executing query: ${error.message}`);
+    throw error;
+  } finally {
+    lock.release();
+  }
 }
 
-// Example usage with retry and deadlock detection:
-retryQuery(pool, 'SELECT * FROM orders')
-  .then((results) => {
-    console.log(results);
-  })
-  .catch((err) => {
-    console.error(err);
-  })
-  .finally(() => {
-    closeDatabaseConnection(pool);
-  });
+// To prevent connection pool exhaustion, use a queue
+class Queue {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.queue = [];
+  }
+
+  enqueue(item) {
+    if (this.queue.length < this.maxSize) {
+      this.queue.push(item);
+    } else {
+      throw new Error('Queue is full');
+    }
+  }
+
+  dequeue() {
+    if (this.queue.length > 0) {
+      return this.queue.shift();
+    } else {
+      return null;
+    }
+  }
+}
+
+const queryQueue = new Queue(100);
+
+function executeQueryWithQueue(query) {
+  queryQueue.enqueue(query);
+  const queuedQuery = queryQueue.dequeue();
+  if (queuedQuery) {
+    executeQueryWithLock(queuedQuery);
+  }
+}
+
+// Test the functions
+executeQueryWithQueue('SELECT * FROM orders');

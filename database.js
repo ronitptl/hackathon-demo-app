@@ -1,92 +1,89 @@
 function connectToDatabase() {
-  const maxConnections = 100;
-  const connectionPool = [];
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    user: 'username',
+    host: 'db.internal',
+    database: 'database',
+    password: 'password',
+    port: 5432,
+    max: 100,
+    idleTimeoutMillis: 10000,
+  });
 
-  function getConnection() {
-    if (connectionPool.length < maxConnections) {
-      const connection = createConnection();
-      connectionPool.push(connection);
-      return connection;
-    } else {
-      throw new Error('Connection pool exhausted');
-    }
-  }
+  pool.on('error', (err) => {
+    console.error('Database error:', err);
+  });
 
-  function releaseConnection(connection) {
-    const index = connectionPool.indexOf(connection);
-    if (index !== -1) {
-      connectionPool.splice(index, 1);
-    }
-  }
-
-  function createConnection() {
-    // Simulate creating a database connection
-    return {};
-  }
-
-  return {
-    getConnection,
-    releaseConnection,
-  };
+  return pool;
 }
 
-const db = connectToDatabase();
-
-function executeQuery(query) {
-  const connection = db.getConnection();
-  try {
-    // Simulate executing a query
-    console.log(`Executing query: ${query}`);
-    return connection;
-  } catch (error) {
-    console.error(`Error executing query: ${error.message}`);
-    throw error;
-  } finally {
-    db.releaseConnection(connection);
-  }
-}
-
-// To prevent deadlock, use a lock mechanism
-class Lock {
-  constructor() {
-    this.locked = false;
-    this.queue = [];
-  }
-
-  acquire() {
-    return new Promise((resolve) => {
-      if (!this.locked) {
-        this.locked = true;
-        resolve();
-      } else {
-        this.queue.push(resolve);
-      }
+function queryDatabase(pool, query) {
+  return pool.query(query)
+    .then((res) => {
+      return res.rows;
+    })
+    .catch((err) => {
+      console.error('Database query error:', err);
+      throw err;
     });
-  }
-
-  release() {
-    if (this.queue.length > 0) {
-      const resolve = this.queue.shift();
-      resolve();
-    } else {
-      this.locked = false;
-    }
-  }
 }
 
-const lock = new Lock();
-
-async function executeQueryWithLock(query) {
-  await lock.acquire();
-  try {
-    return executeQuery(query);
-  } catch (error) {
-    console.error(`Error executing query with lock: ${error.message}`);
-    throw error;
-  } finally {
-    lock.release();
-  }
+function releaseConnection(pool) {
+  pool.end();
 }
 
-// Example usage:
-executeQueryWithLock('SELECT * FROM orders');
+function acquireConnectionWithRetry(pool, maxRetries = 5, retryDelay = 500) {
+  let retries = 0;
+  const acquireConnection = () => {
+    return pool.connect()
+      .then((client) => {
+        return client;
+      })
+      .catch((err) => {
+        if (retries < maxRetries) {
+          retries++;
+          console.log(`Database connection attempt ${retries} failed. Retrying in ${retryDelay}ms...`);
+          return new Promise((resolve) => {
+            setTimeout(() => {
+              resolve(acquireConnection());
+            }, retryDelay);
+          });
+        } else {
+          console.error('Max retry attempts reached. Database unreachable.');
+          throw err;
+        }
+      });
+  };
+
+  return acquireConnection();
+}
+
+function executeTransaction(pool, query) {
+  return acquireConnectionWithRetry(pool)
+    .then((client) => {
+      return client.query('BEGIN')
+        .then(() => {
+          return client.query(query);
+        })
+        .then(() => {
+          return client.query('COMMIT');
+        })
+        .catch((err) => {
+          return client.query('ROLLBACK')
+            .then(() => {
+              throw err;
+            });
+        })
+        .finally(() => {
+          client.release();
+        });
+    });
+}
+
+module.exports = {
+  connectToDatabase,
+  queryDatabase,
+  releaseConnection,
+  acquireConnectionWithRetry,
+  executeTransaction,
+};

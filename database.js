@@ -1,36 +1,78 @@
-const Database = require('better-sqlite3');
-const db = new Database('chatflow.db');
+function connectToDatabase() {
+  const { Pool } = require('pg');
+  const pool = new Pool({
+    user: 'username',
+    host: 'db.internal',
+    database: 'database',
+    password: 'password',
+    port: 5432,
+    max: 100,
+    idleTimeoutMillis: 30000
+  });
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+  pool.on('error', (err, client) => {
+    console.error('Unexpected error on idle client', err);
+    process.exit(-1);
+  });
 
-  CREATE TABLE IF NOT EXISTS rooms (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+  return pool;
+}
 
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id INTEGER,
-    user_id INTEGER,
-    content TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(room_id) REFERENCES rooms(id),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-`);
+function queryDatabase(pool, query) {
+  return pool.query(query)
+    .then((res) => {
+      return res.rows;
+    })
+    .catch((err) => {
+      console.error('Error querying database', err);
+      throw err;
+    });
+}
 
-// Seed default rooms
-const seedRooms = db.prepare(`INSERT OR IGNORE INTO rooms (name) VALUES (?)`);
-['general', 'random', 'tech-talk', 'support'].forEach(r => seedRooms.run(r));
+function closeDatabaseConnection(pool) {
+  pool.end();
+}
 
-// Seed default users
-const seedUsers = db.prepare(`INSERT OR IGNORE INTO users (username) VALUES (?)`);
-['alice', 'bob', 'charlie', 'diana', 'eve'].forEach(u => seedUsers.run(u));
+// Example usage:
+const pool = connectToDatabase();
 
-module.exports = db;
+// Implement retry logic with exponential backoff
+function retryQuery(pool, query, retries = 0) {
+  return queryDatabase(pool, query)
+    .catch((err) => {
+      if (retries < 5) {
+        const delay = Math.pow(2, retries) * 1000;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(retryQuery(pool, query, retries + 1));
+          }, delay);
+        });
+      } else {
+        throw err;
+      }
+    });
+}
+
+// Deadlock detection and handling
+function detectDeadlock(pool, query) {
+  return pool.query(`SELECT * FROM pg_locks WHERE relation = 'orders' AND mode = 'exclusive'`)
+    .then((res) => {
+      if (res.rows.length > 0) {
+        throw new Error('Deadlock detected on table=orders');
+      } else {
+        return queryDatabase(pool, query);
+      }
+    });
+}
+
+// Example usage with retry and deadlock detection:
+retryQuery(pool, 'SELECT * FROM orders')
+  .then((results) => {
+    console.log(results);
+  })
+  .catch((err) => {
+    console.error(err);
+  })
+  .finally(() => {
+    closeDatabaseConnection(pool);
+  });

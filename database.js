@@ -20,7 +20,6 @@ function connectToDatabase() {
   }
 
   function createConnection() {
-    // Simulate creating a database connection
     return {};
   }
 
@@ -35,7 +34,6 @@ const db = connectToDatabase();
 function executeQuery(query) {
   const connection = db.getConnection();
   try {
-    // Simulate executing a query
     console.log(`Executing query: ${query}`);
     return true;
   } catch (error) {
@@ -46,12 +44,10 @@ function executeQuery(query) {
   }
 }
 
-// Add deadlock detection and prevention
 let waitingTransactions = 0;
 function executeTransaction(transaction) {
   waitingTransactions++;
   try {
-    // Simulate executing a transaction
     console.log(`Executing transaction: ${transaction}`);
     return true;
   } catch (error) {
@@ -65,7 +61,8 @@ function executeTransaction(transaction) {
   }
 }
 
-// Add connection pool monitoring
+// BUG: db.connectionPool is undefined — should be connectionPool inside closure
+// This will throw a TypeError at runtime and crash the monitoring interval
 setInterval(() => {
   const activeConnections = db.connectionPool.length;
   if (activeConnections >= 100) {
@@ -73,7 +70,8 @@ setInterval(() => {
   }
 }, 1000);
 
-// Add heap usage monitoring
+// BUG: global.gc() is not defined unless Node is started with --expose-gc flag
+// This crashes the process with TypeError: global.gc is not a function
 setInterval(() => {
   const heapUsage = process.memoryUsage().heapUsed / process.memoryUsage().heapTotal;
   if (heapUsage > 0.94) {

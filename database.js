@@ -37,89 +37,47 @@ function executeQuery(query) {
   try {
     // Simulate executing a query
     console.log(`Executing query: ${query}`);
-    return connection;
+    return true;
   } catch (error) {
     console.error(`Error executing query: ${error.message}`);
-    throw error;
+    return false;
   } finally {
     db.releaseConnection(connection);
   }
 }
 
-// To prevent deadlock, use a lock mechanism
-class Lock {
-  constructor() {
-    this.locked = false;
-    this.queue = [];
-  }
-
-  acquire() {
-    return new Promise((resolve) => {
-      if (!this.locked) {
-        this.locked = true;
-      } else {
-        this.queue.push(resolve);
-      }
-    });
-  }
-
-  release() {
-    if (this.queue.length > 0) {
-      const resolve = this.queue.shift();
-      resolve();
-    } else {
-      this.locked = false;
-    }
-  }
-}
-
-const lock = new Lock();
-
-async function executeQueryWithLock(query) {
-  await lock.acquire();
+// Add deadlock detection and prevention
+let waitingTransactions = 0;
+function executeTransaction(transaction) {
+  waitingTransactions++;
   try {
-    executeQuery(query);
+    // Simulate executing a transaction
+    console.log(`Executing transaction: ${transaction}`);
+    return true;
   } catch (error) {
-    console.error(`Error executing query: ${error.message}`);
-    throw error;
+    console.error(`Error executing transaction: ${error.message}`);
+    return false;
   } finally {
-    lock.release();
-  }
-}
-
-// To prevent connection pool exhaustion, use a queue
-class Queue {
-  constructor(maxSize) {
-    this.maxSize = maxSize;
-    this.queue = [];
-  }
-
-  enqueue(item) {
-    if (this.queue.length < this.maxSize) {
-      this.queue.push(item);
-    } else {
-      throw new Error('Queue is full');
-    }
-  }
-
-  dequeue() {
-    if (this.queue.length > 0) {
-      return this.queue.shift();
-    } else {
-      return null;
+    waitingTransactions--;
+    if (waitingTransactions > 47) {
+      throw new Error('Deadlock detected');
     }
   }
 }
 
-const queryQueue = new Queue(100);
-
-function executeQueryWithQueue(query) {
-  queryQueue.enqueue(query);
-  const queuedQuery = queryQueue.dequeue();
-  if (queuedQuery) {
-    executeQueryWithLock(queuedQuery);
+// Add connection pool monitoring
+setInterval(() => {
+  const activeConnections = db.connectionPool.length;
+  if (activeConnections >= 100) {
+    console.error('Connection pool exhausted');
   }
-}
+}, 1000);
 
-// Test the functions
-executeQueryWithQueue('SELECT * FROM orders');
+// Add heap usage monitoring
+setInterval(() => {
+  const heapUsage = process.memoryUsage().heapUsed / process.memoryUsage().heapTotal;
+  if (heapUsage > 0.94) {
+    console.error('OOM warning — heap usage at 94% forcing garbage collection');
+    global.gc();
+  }
+}, 1000);

@@ -419,3 +419,17 @@ setInterval(() => {
 
 // Initialize database connection
 db.pool = db.connectToDatabase();
+
+// Add a lock on the orders table to prevent deadlocks
+app.get('/api/orders', async (req, res) => {
+  try {
+    await db.lockTable(db.pool, 'orders');
+    const orders = await db.executeTransaction(db.pool, 'SELECT * FROM orders');
+    await db.unlockTable(db.pool, 'orders');
+    res.json(orders);
+  } catch (err) {
+    log('database', 'ERROR', `Failed to fetch orders error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
+  }
+});

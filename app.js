@@ -70,19 +70,16 @@ wss.on('connection', (ws, req) => {
       }
 
       // Save message to DB
-      await db.lockTable(db.pool, 'orders');
       const user = await db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
       const room = await db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
 
       if (!user || !room) {
         log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
           { status: 404, latency: Date.now() - start });
-        await db.unlockTable(db.pool, 'orders');
         return;
       }
 
       const result = await db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
-      await db.unlockTable(db.pool, 'orders');
 
       const latency = Date.now() - start;
       log('database', latency > 500 ? 'WARN' : 'INFO',
@@ -298,6 +295,54 @@ app.get('/api/orders', async (req, res) => {
     res.json(orders);
   } catch (err) {
     log('database', 'ERROR', `Failed to fetch orders error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fix the deadlock issue by using a transaction
+app.get('/api/messages/:room', (req, res) => {
+  const start = Date.now();
+  try {
+    if (incidentActive) {
+      log('database', 'ERROR',
+        `Query timeout on messages table room=${req.params.room} waited=${dbQueryDelay}ms`,
+        { status: 503, latency: dbQueryDelay });
+      return res.status(503).json({ error: 'Database timeout' });
+    }
+    db.pool.query('BEGIN', (err, result) => {
+      if (err) {
+        log('database', 'ERROR', `Failed to start transaction error=${err.message}`,
+          { status: 500, latency: Date.now() - start });
+        res.status(500).json({ error: err.message });
+      } else {
+        db.pool.query(`
+          SELECT m.id, m.content, m.created_at, u.username, r.name as room
+          FROM messages m
+          JOIN users u ON m.user_id = u.id
+          JOIN rooms r ON m.room_id = r.id
+          WHERE r.name = '${req.params.room}'
+          ORDER BY m.created_at DESC LIMIT 50
+        `, (err, result) => {
+          if (err) {
+            log('database', 'ERROR', `Failed to fetch messages error=${err.message}`,
+              { status: 500, latency: Date.now() - start });
+            db.pool.query('ROLLBACK', () => {
+              res.status(500).json({ error: err.message });
+            });
+          } else {
+            db.pool.query('COMMIT', () => {
+              log('database', 'INFO',
+                `Messages fetched room=${req.params.room} count=${result.rows.length}`,
+                { latency: Date.now() - start, status: 200 });
+              res.json({ messages: result.rows.reverse() });
+            });
+          }
+        });
+      }
+    });
+  } catch (err) {
+    log('database', 'ERROR', `DB query failed error=${err.message}`,
       { status: 500, latency: Date.now() - start });
     res.status(500).json({ error: err.message });
   }

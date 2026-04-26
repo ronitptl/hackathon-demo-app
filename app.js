@@ -70,8 +70,8 @@ wss.on('connection', (ws, req) => {
       }
 
       // Save message to DB
-      const user = await db.executeTransaction(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
-      const room = await db.executeTransaction(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
+      const user = await db.handleDeadlock(db.pool, `SELECT id FROM users WHERE username = '${msg.username}'`);
+      const room = await db.handleDeadlock(db.pool, `SELECT id FROM rooms WHERE name = '${msg.room}'`);
 
       if (!user || !room) {
         log('api-gateway', 'WARN', `Unknown user or room user=${msg.username} room=${msg.room}`,
@@ -79,7 +79,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      const result = await db.executeTransaction(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
+      const result = await db.handleDeadlock(db.pool, `INSERT INTO messages (room_id, user_id, content) VALUES (${room.id}, ${user.id}, '${msg.content}')`);
 
       const latency = Date.now() - start;
       log('database', latency > 500 ? 'WARN' : 'INFO',
@@ -149,7 +149,7 @@ app.get('/health', (req, res) => {
 app.get('/api/rooms', (req, res) => {
   const start = Date.now();
   try {
-    const rooms = db.executeTransaction(db.pool, `SELECT * FROM rooms`);
+    const rooms = await db.handleDeadlock(db.pool, `SELECT * FROM rooms`);
     log('api-gateway', 'INFO', `GET /api/rooms rooms=${rooms.length}`,
       { latency: Date.now() - start, status: 200 });
     res.json({ rooms });
@@ -169,7 +169,7 @@ app.get('/api/messages/:room', (req, res) => {
         { status: 503, latency: dbQueryDelay });
       return res.status(503).json({ error: 'Database timeout' });
     }
-    const messages = db.executeTransaction(db.pool, `
+    const messages = await db.handleDeadlock(db.pool, `
       SELECT m.id, m.content, m.created_at, u.username, r.name as room
       FROM messages m
       JOIN users u ON m.user_id = u.id
@@ -298,4 +298,113 @@ app.get('/api/orders', async (req, res) => {
       { status: 500, latency: Date.now() - start });
     res.status(500).json({ error: err.message });
   }
+}); 
+
+// Fix the bug by adding a try-catch block to handle the error when acquiring a connection from the pool
+app.get('/api/orders', async (req, res) => {
+  try {
+    await db.lockTable(db.pool, 'orders');
+    const orders = await db.executeTransaction(db.pool, 'SELECT * FROM orders');
+    await db.unlockTable(db.pool, 'orders');
+    res.json(orders);
+  } catch (err) {
+    log('database', 'ERROR', `Failed to fetch orders error=${err.message}`,
+      { status: 500, latency: Date.now() - start });
+    res.status(500).json({ error: err.message });
+  }
 });
+
+// Fix the bug by adding a try-catch block to handle the error when acquiring a connection from the pool
+db.acquireConnectionWithRetry = async function(pool, maxRetries = 5, retryDelay = 500) {
+  let retries = 0;
+  const acquireConnection = async () => {
+    try {
+      const client = await pool.connect();
+      return client;
+    } catch (err) {
+      if (retries < maxRetries) {
+        retries++;
+        console.log(`Database connection attempt ${retries} failed. Retrying in ${retryDelay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        return acquireConnection();
+      } else {
+        console.error('Max retry attempts reached. Database unreachable.');
+        throw err;
+      }
+    }
+  };
+
+  return acquireConnection();
+};
+
+// Fix the bug by adding a try-catch block to handle the error when executing a transaction
+db.executeTransaction = async function(pool, query) {
+  try {
+    const client = await db.acquireConnectionWithRetry(pool);
+    try {
+      const result = await client.query(query);
+      return result;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Database query error:', err);
+    throw err;
+  }
+}; 
+
+// Fix the bug by adding a try-catch block to handle the error when locking a table
+db.lockTable = async function(pool, tableName) {
+  try {
+    const client = await db.acquireConnectionWithRetry(pool);
+    try {
+      const result = await client.query(`LOCK TABLE ${tableName} IN EXCLUSIVE MODE`);
+      return result;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Database query error:', err);
+    throw err;
+  }
+};
+
+// Fix the bug by adding a try-catch block to handle the error when unlocking a table
+db.unlockTable = async function(pool, tableName) {
+  try {
+    const client = await db.acquireConnectionWithRetry(pool);
+    try {
+      const result = await client.query(`UNLOCK TABLE ${tableName}`);
+      return result;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Database query error:', err);
+    throw err;
+  }
+}; 
+
+// Fix the bug by adding a try-catch block to handle the error when handling a deadlock
+db.handleDeadlock = async function(pool, query) {
+  try {
+    const client = await db.acquireConnectionWithRetry(pool);
+    try {
+      const result = await client.query(query);
+      return result;
+    } catch (err) {
+      if (err.code === '40P01') { 
+        console.error('Deadlock detected. Retrying query...');
+        return db.handleDeadlock(pool, query);
+      } else {
+        console.error('Database query error:', err);
+        throw err;
+      }
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Database query error:', err);
+    throw err;
+  }
+};
